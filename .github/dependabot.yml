@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # Keeps the SHA pins in the shared workflows current (one grouped PR a week).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

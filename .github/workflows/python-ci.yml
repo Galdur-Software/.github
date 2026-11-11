@@ -1,0 +1,66 @@
+# Reusable: install a Python app's requirements with uv and run its test command.
+#
+#   jobs:
+#     ci:
+#       uses: Galdur-Software/.github/.github/workflows/python-ci.yml@<sha> # v1
+#       with:
+#         test-command: python tests/smoke.py --strict
+name: python-ci
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: Python version for the virtualenv
+        type: string
+        default: "3.14"
+      requirements:
+        description: Requirements file to install (relative to working-directory)
+        type: string
+        default: requirements.txt
+      test-command:
+        description: Shell command run inside the virtualenv
+        type: string
+        default: python tests/smoke.py --strict
+      working-directory:
+        description: Folder the app lives in
+        type: string
+        default: .
+
+permissions: {}
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ inputs.python-version }}
+          enable-cache: true
+          cache-dependency-glob: ${{ inputs.working-directory }}/${{ inputs.requirements }}
+
+      - name: Install requirements
+        env:
+          REQUIREMENTS: ${{ inputs.requirements }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+        run: |
+          uv venv .venv --python "$PYTHON_VERSION"
+          uv pip install --python .venv/bin/python -r "$REQUIREMENTS"
+
+      - name: Test
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: |
+          source .venv/bin/activate
+          bash -euo pipefail -c "$TEST_COMMAND"
