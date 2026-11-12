@@ -8,6 +8,7 @@ Nothing here holds secrets, host names or client data: a repo calls a workflow, 
 |---|---|
 | `python-ci.yml` | uv virtualenv, `pip install -r requirements.txt`, then the repo's test command (default `python tests/smoke.py --strict`) |
 | `security.yml` | gitleaks over the whole git history, zizmor over the repo's own workflows; plain binaries, checksum-verified |
+| `docker-image.yml` | `docker build`; with `push: true` from a `vX.Y.Z` tag, push `ghcr.io/<owner>/<repo>:X.Y.Z` (must match `VERSION`) and `:sha-…`. Needs `packages: write` |
 
 ## Using one
 

@@ -1,0 +1,91 @@
+# Reusable: build the repo's Dockerfile and, on a version tag, push it to GitHub's container registry.
+#
+#   ghcr.io/<owner, lowercase>/<repo>:<version>   (tag v1.2.3 → 1.2.3; must match the VERSION file if there is one)
+#   ghcr.io/<owner, lowercase>/<repo>:sha-<12 chars of the commit>
+#
+# With push: false (pull requests, main) it only builds, so a broken Dockerfile fails before a release.
+# Plain docker CLI on the runner: no third-party action. The image is labelled with its source repo,
+# so the package inherits that repo's visibility (a private repo gives a private image).
+#
+#   jobs:
+#     image:
+#       uses: Galdur-Software/.github/.github/workflows/docker-image.yml@<sha> # v1
+#       permissions:
+#         contents: read
+#         packages: write
+#       with:
+#         push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+name: docker-image
+
+on:
+  workflow_call:
+    inputs:
+      push:
+        description: Push to ghcr.io (only from a vX.Y.Z tag)
+        type: boolean
+        default: false
+      context:
+        description: Build context (folder with the Dockerfile)
+        type: string
+        default: .
+
+permissions: {}
+
+jobs:
+  image:
+    name: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Name and version
+        id: meta
+        env:
+          PUSH: ${{ inputs.push }}
+          CONTEXT: ${{ inputs.context }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha="sha-${GITHUB_SHA::12}"
+          version=""
+          if [ "$PUSH" = "true" ]; then
+            if [[ ! "$GITHUB_REF" =~ ^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+              echo "::error::push only from a vX.Y.Z tag (got $GITHUB_REF)"; exit 1
+            fi
+            version="${BASH_REMATCH[1]}"
+            if [ -f "$CONTEXT/VERSION" ] && [ "$(tr -d '[:space:]' < "$CONTEXT/VERSION")" != "$version" ]; then
+              echo "::error::tag v$version does not match VERSION ($(cat "$CONTEXT/VERSION"))"; exit 1
+            fi
+          fi
+          { echo "image=$image"; echo "sha=$sha"; echo "version=$version"; } >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SHA_TAG: ${{ steps.meta.outputs.sha }}
+          CONTEXT: ${{ inputs.context }}
+        run: |
+          docker build "$CONTEXT" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "$IMAGE:$SHA_TAG"
+
+      - name: Push
+        if: inputs.push
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SHA_TAG: ${{ steps.meta.outputs.sha }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag "$IMAGE:$SHA_TAG" "$IMAGE:$VERSION"
+          docker push "$IMAGE:$SHA_TAG"
+          docker push "$IMAGE:$VERSION"
+          docker logout ghcr.io
+          echo "Pushed $IMAGE:$VERSION" >> "$GITHUB_STEP_SUMMARY"
