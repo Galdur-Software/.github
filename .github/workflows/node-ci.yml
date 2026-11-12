@@ -1,0 +1,72 @@
+# Reusable: install a Node app's packages with npm ci, build it, and run its test command.
+#
+#   jobs:
+#     build:
+#       uses: Galdur-Software/.github/.github/workflows/node-ci.yml@<sha> # v1
+#       with:
+#         build-command: npm run build
+#         test-command: npm test
+name: node-ci
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version (ignored when node-version-file is set)
+        type: string
+        default: "24"
+      node-version-file:
+        description: File with the Node.js version, such as .nvmrc (relative to working-directory)
+        type: string
+        default: ""
+      build-command:
+        description: Shell command that builds the app; empty skips the build
+        type: string
+        default: npm run build
+      test-command:
+        description: Shell command run after the build; empty skips it
+        type: string
+        default: ""
+      working-directory:
+        description: Folder the app lives in
+        type: string
+        default: .
+
+permissions: {}
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file != '' && format('{0}/{1}', inputs.working-directory, inputs.node-version-file) || '' }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install packages
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        if: inputs.build-command != ''
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: bash -euo pipefail -c "$BUILD_COMMAND"
+
+      - name: Test
+        if: inputs.test-command != ''
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: bash -euo pipefail -c "$TEST_COMMAND"
