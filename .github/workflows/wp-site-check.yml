@@ -1,0 +1,103 @@
+# Reusable: run the calling repo's site check script (Playwright, Chromium) against a preview or a live site and keep
+# its markdown report as an artifact. The job fails when the script exits non-zero.
+#
+# The script is called as:  <script> <url> --ut <report.md> [--lifandi] [--innskraning-skra <file>]
+#
+#   jobs:
+#     check:
+#       uses: Galdur-Software/.github/.github/workflows/wp-site-check.yml@<sha> # v1
+#       permissions:
+#         contents: read
+#       with:
+#         url: https://example.com
+#         live: true
+#       secrets:
+#         login: ${{ secrets.PREVIEW_LOGIN }}   # only for a password-protected preview
+name: wp-site-check
+
+on:
+  workflow_call:
+    inputs:
+      url:
+        description: Front page of the site to check
+        type: string
+        required: true
+      live:
+        description: The site is public and must be open to search engines (passes --lifandi)
+        type: boolean
+        default: false
+      script:
+        description: Path of the check script in the calling repo
+        type: string
+        default: tools/athuga_vef.py
+      playwright-version:
+        description: Playwright version from PyPI
+        type: string
+        default: "1.64.0"
+      python-version:
+        description: Python version
+        type: string
+        default: "3.12"
+      artifact-name:
+        description: Name of the report artifact
+        type: string
+        default: site-check
+    secrets:
+      login:
+        description: '"user:password" for a password-protected preview. Written to a 0600 file and never printed'
+        required: false
+
+permissions: {}
+
+jobs:
+  check:
+    name: site check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install Playwright and Chromium
+        env:
+          PLAYWRIGHT_VERSION: ${{ inputs.playwright-version }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+        run: |
+          uv venv "$RUNNER_TEMP/venv" --python "$PYTHON_VERSION"
+          uv pip install --python "$RUNNER_TEMP/venv/bin/python" "playwright==${PLAYWRIGHT_VERSION}"
+          "$RUNNER_TEMP/venv/bin/python" -m playwright install --with-deps chromium
+
+      - name: Check the site
+        env:
+          SITE_URL: ${{ inputs.url }}
+          LIVE: ${{ inputs.live }}
+          SCRIPT: ${{ inputs.script }}
+          LOGIN: ${{ secrets.login }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/report"
+          args=("$SITE_URL" --ut "$RUNNER_TEMP/report/report.md")
+          [ "$LIVE" = true ] && args+=(--lifandi)
+          if [ -n "$LOGIN" ]; then
+            (umask 077; printf '%s' "$LOGIN" > "$RUNNER_TEMP/login")
+            args+=(--innskraning-skra "$RUNNER_TEMP/login")
+          fi
+          status=0
+          "$RUNNER_TEMP/venv/bin/python" -I "$SCRIPT" "${args[@]}" || status=$?
+          rm -f "$RUNNER_TEMP/login"
+          [ -f "$RUNNER_TEMP/report/report.md" ] && cat "$RUNNER_TEMP/report/report.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/report
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,0 +1,234 @@
+# Reusable: deploy WordPress theme and plugin packages over SFTP (password login, no shell needed), then check over
+# the REST API with an application password that the site now reports the deployed versions.
+#
+# It deploys only what was tested: the packages come from the successful run of the CI workflow for that exact commit
+# (the artifact wp-ci.yml uploaded), and the commit must be on the deploy branch. Redeploying an older commit is a
+# rollback. Files deleted from a package are not deleted on the server.
+#
+# Call it from a workflow that only a person starts (workflow_dispatch): that button press is the approval.
+#
+#   jobs:
+#     deploy:
+#       uses: Galdur-Software/.github/.github/workflows/wp-deploy-sftp.yml@<sha> # v1
+#       permissions:
+#         contents: read
+#         actions: read
+#       with:
+#         version: ${{ inputs.version }}
+#         sftp-host: sftp.example.com
+#         sftp-port: 22
+#         sftp-user: deploy@example.com
+#         targets: |
+#           my-theme=/htdocs/wp-content/themes/my-theme
+#           my-plugin=/htdocs/wp-content/plugins/my-plugin
+#         site-url: https://example.com
+#         wp-user: admin-user
+#       secrets:
+#         sftp-password: ${{ secrets.SFTP_PASSWORD }}
+#         wp-app-password: ${{ secrets.WP_APP_PASSWORD }}
+name: wp-deploy-sftp
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Full commit SHA to deploy. Empty deploys the commit the calling workflow runs on
+        type: string
+        default: ""
+      branch:
+        description: The commit must be on this branch
+        type: string
+        default: main
+      ci-workflow:
+        description: Workflow file whose successful run for the commit holds the packages
+        type: string
+        default: ci.yml
+      artifact-name:
+        description: Name of the package artifact in that run (zips named <slug>-<version>.zip, plus SHA256SUMS)
+        type: string
+        default: packages
+      targets:
+        description: 'One "slug=/remote/dir" per line; the remote dir must end in /slug'
+        type: string
+        required: true
+      sftp-host:
+        description: SFTP server
+        type: string
+        required: true
+      sftp-port:
+        description: SFTP port
+        type: number
+        default: 22
+      sftp-user:
+        description: SFTP user
+        type: string
+        required: true
+      known-hosts-file:
+        description: File in the calling repo with the server's public host keys (StrictHostKeyChecking=yes)
+        type: string
+        default: .github/known_hosts
+      site-url:
+        description: Site URL for the REST check, e.g. https://example.com
+        type: string
+        required: true
+      wp-user:
+        description: WordPress user that owns the application password
+        type: string
+        required: true
+    secrets:
+      sftp-password:
+        required: true
+      wp-app-password:
+        required: true
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find the tested packages
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          BRANCH: ${{ inputs.branch }}
+          CI_WORKFLOW: ${{ inputs.ci-workflow }}
+        run: |
+          version="${VERSION:-$GITHUB_SHA}"
+          [[ "$version" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::version must be a full 40-character commit SHA"; exit 1; }
+          git merge-base --is-ancestor "$version" "origin/$BRANCH" \
+            || { echo "::error::$version is not on $BRANCH"; exit 1; }
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$CI_WORKFLOW" --commit "$version" \
+                     --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          [ -n "$run_id" ] || { echo "::error::No successful $CI_WORKFLOW run for $version, so nothing tested to deploy"; exit 1; }
+          echo "Deploying $version from run $run_id"
+          {
+            echo "version=$version"
+            echo "run-id=$run_id"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          run-id: ${{ steps.find.outputs.run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/packages
+
+      - name: Verify and unpack
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          pk="$RUNNER_TEMP/packages" st="$RUNNER_TEMP/stage"
+          (cd "$pk" && sha256sum -c SHA256SUMS)
+          mkdir -p "$st"
+          : > "$RUNNER_TEMP/targets.tsv"
+          while IFS= read -r line; do
+            line="${line//[[:space:]]/}"
+            [ -z "$line" ] && continue
+            slug="${line%%=*}" remote="${line#*=}"
+            [[ "$slug" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || { echo "::error::Bad slug '$slug'"; exit 1; }
+            [[ "$remote" == /* && "$remote" == */"$slug" && "$remote" != *..* ]] \
+              || { echo "::error::Remote dir for $slug must be absolute and end in /$slug: '$remote'"; exit 1; }
+            zip="" ver=""
+            for f in "$pk"/*.zip; do
+              b="$(basename "$f")"
+              if [[ "$b" =~ ^${slug}-([0-9][0-9A-Za-z.-]*)\.zip$ ]]; then
+                [ -z "$zip" ] || { echo "::error::More than one package for $slug"; exit 1; }
+                zip="$f" ver="${BASH_REMATCH[1]}"
+              fi
+            done
+            [ -n "$zip" ] || { echo "::error::No package for $slug"; exit 1; }
+            unzip -q "$zip" -d "$st"
+            [ -d "$st/$slug" ] || { echo "::error::$(basename "$zip") has no top folder $slug/"; exit 1; }
+            printf '%s\t%s\t%s\n' "$slug" "$ver" "$remote" >> "$RUNNER_TEMP/targets.tsv"
+            echo "$slug $ver -> $remote ($(find "$st/$slug" -type f | wc -l) files)"
+          done <<<"$TARGETS"
+          [ -s "$RUNNER_TEMP/targets.tsv" ] || { echo "::error::No targets"; exit 1; }
+
+      - name: Upload over SFTP
+        env:
+          SFTP_HOST: ${{ inputs.sftp-host }}
+          SFTP_PORT: ${{ inputs.sftp-port }}
+          SFTP_USER: ${{ inputs.sftp-user }}
+          KNOWN_HOSTS_FILE: ${{ inputs.known-hosts-file }}
+          SFTP_PASSWORD: ${{ secrets.sftp-password }}
+        run: |
+          [ -s "$KNOWN_HOSTS_FILE" ] || { echo "::error::No host keys in $KNOWN_HOSTS_FILE"; exit 1; }
+          st="$RUNNER_TEMP/stage" batch="$RUNNER_TEMP/sftp-batch" askpass="$RUNNER_TEMP/askpass"
+          # The askpass helper reads the password from its environment, so it is never written to disk
+          (umask 077; cat > "$askpass" <<'EOF'
+          #!/bin/sh
+          printf '%s\n' "$SFTP_PASSWORD"
+          EOF
+          )
+          chmod 700 "$askpass"
+          # The server may not create folders on put -r, so every folder is made first and each file sent on its own
+          while IFS=$'\t' read -r slug _ remote; do
+            echo "-mkdir \"$remote\""
+            (cd "$st/$slug" && find . -mindepth 1 -type d | sed 's#^\./##' | LC_ALL=C sort) \
+              | while IFS= read -r d; do echo "-mkdir \"$remote/$d\""; done
+            (cd "$st/$slug" && find . -type f | sed 's#^\./##' | LC_ALL=C sort) \
+              | while IFS= read -r f; do echo "put \"$st/$slug/$f\" \"$remote/$f\""; done
+          done < "$RUNNER_TEMP/targets.tsv" > "$batch"
+          echo "$(grep -c '^put ' "$batch") files to send"
+          status=0
+          SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 \
+            sftp -b "$batch" -P "$SFTP_PORT" -o BatchMode=no -o LogLevel=ERROR \
+              -o UserKnownHostsFile="$PWD/$KNOWN_HOSTS_FILE" -o StrictHostKeyChecking=yes \
+              -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no \
+              -o ConnectTimeout=20 -o ServerAliveInterval=30 -o User="$SFTP_USER" "$SFTP_HOST" \
+            > "$RUNNER_TEMP/sftp.log" 2>&1 || status=$?
+          rm -f "$askpass"
+          grep -v -E '^sftp> (put|-mkdir) ' "$RUNNER_TEMP/sftp.log" || true
+          [ "$status" = 0 ] || echo "::error::sftp exited with $status"
+          exit "$status"
+
+      - name: Check versions over REST
+        env:
+          SITE_URL: ${{ inputs.site-url }}
+          WP_USER: ${{ inputs.wp-user }}
+          WP_APP_PASSWORD: ${{ secrets.wp-app-password }}
+          VERSION: ${{ steps.find.outputs.version }}
+        run: |
+          auth() { printf 'user = "%s:%s"\n' "$WP_USER" "${WP_APP_PASSWORD// /}"; }
+          get() { curl -fsS --retry 2 -K <(auth) "${SITE_URL%/}/wp-json$1"; }
+          ok=1
+          {
+            echo "### Deployed $VERSION"
+            echo "| Package | Version | Site reports |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS=$'\t' read -r slug ver _; do
+            seen=""
+            for _ in 1 2 3; do
+              plugin=$( (get '/wp/v2/plugins?context=edit&_fields=plugin,version,status' \
+                | jq -r --arg s "$slug/" '.[] | select(.plugin | startswith($s)) | "\(.version) \(.status)"' \
+                | head -n1) || true)
+              if [ -n "$plugin" ]; then
+                seen="$plugin"
+              else
+                seen=$( (get "/wp/v2/themes/$slug?_fields=version,status" | jq -r '"\(.version) \(.status)"') || true)
+              fi
+              [ "${seen%% *}" = "$ver" ] && break
+              sleep 10
+            done
+            echo "| $slug | $ver | $seen |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${seen%% *}" = "$ver" ]; then
+              echo "$slug: $seen"
+            else
+              echo "::error::$slug: the site reports '$seen', expected $ver (a persistent object cache can hold the old version)"
+              ok=0
+            fi
+          done < "$RUNNER_TEMP/targets.tsv"
+          [ "$ok" = 1 ]

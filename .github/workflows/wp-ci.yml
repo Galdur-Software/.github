@@ -1,0 +1,141 @@
+# Reusable: PHP lint of WordPress themes and plugins on several PHP versions, the repo's own tests, and its
+# package command. The packages are uploaded as an artifact, which wp-deploy-sftp.yml later deploys unchanged.
+#
+#   jobs:
+#     wp:
+#       uses: Galdur-Software/.github/.github/workflows/wp-ci.yml@<sha> # v1
+#       permissions:
+#         contents: read
+#       with:
+#         paths: themes/my-theme plugins/my-plugin
+#         package-command: bash tools/package.sh dist themes/my-theme plugins/my-plugin
+#         package-dir: dist
+name: wp-ci
+
+on:
+  workflow_call:
+    inputs:
+      paths:
+        description: Space-separated theme and plugin folders to lint
+        type: string
+        required: true
+      php-versions:
+        description: JSON list of PHP versions to lint on (official php:<version>-cli images, no network)
+        type: string
+        default: '["7.4", "8.3"]'
+      test-command:
+        description: Shell command for the repo's own tests (PHP 8.3 from the runner image, Python with uv). Empty skips it
+        type: string
+        default: ""
+      package-command:
+        description: Shell command that writes the release packages into package-dir. Empty skips packaging
+        type: string
+        default: ""
+      package-dir:
+        description: Folder the package command writes to; uploaded as the artifact
+        type: string
+        default: dist
+      artifact-name:
+        description: Name of the package artifact
+        type: string
+        default: packages
+      retention-days:
+        description: Days to keep the package artifact (older versions can be redeployed until then)
+        type: number
+        default: 90
+
+permissions: {}
+
+jobs:
+  lint:
+    name: lint (PHP ${{ matrix.php }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ${{ fromJSON(inputs.php-versions) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Deprecations count as failures: they become errors on the next PHP version.
+      - name: php -l on every .php file
+        env:
+          PHP_VERSION: ${{ matrix.php }}
+          LINT_PATHS: ${{ inputs.paths }}
+        run: |
+          read -ra dirs <<<"$LINT_PATHS"
+          for d in "${dirs[@]}"; do
+            [ -d "$d" ] || { echo "::error::No folder $d"; exit 1; }
+          done
+          docker run --rm --network none -v "$PWD:/src:ro" -w /src -e LINT_PATHS "php:${PHP_VERSION}-cli" sh -c '
+            n=0; bad=0
+            for f in $(find $LINT_PATHS -name "*.php" | sort); do
+              n=$((n+1))
+              out=$(php -n -d display_errors=1 -d error_reporting=-1 -l "$f" 2>&1); rc=$?
+              rest=$(printf "%s\n" "$out" | grep -v "^No syntax errors detected")
+              if [ $rc -ne 0 ] || [ -n "$rest" ]; then bad=$((bad+1)); printf "%s\n" "$rest"; fi
+            done
+            echo "PHP $(php -r "echo PHP_VERSION;"): $n files, $bad with errors or warnings"
+            [ "$n" -gt 0 ] && [ "$bad" -eq 0 ]'
+
+  test:
+    name: test
+    if: inputs.test-command != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Test
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: bash -euo pipefail -c "$TEST_COMMAND"
+
+  package:
+    name: package
+    needs: [lint, test]
+    if: >-
+      !cancelled() && inputs.package-command != '' && needs.lint.result == 'success'
+      && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Package
+        env:
+          PACKAGE_COMMAND: ${{ inputs.package-command }}
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+        run: |
+          bash -euo pipefail -c "$PACKAGE_COMMAND"
+          [ -n "$(find "$PACKAGE_DIR" -maxdepth 1 -name '*.zip' -print -quit 2>/dev/null)" ] \
+            || { echo "::error::The package command wrote no .zip into $PACKAGE_DIR"; exit 1; }
+          {
+            echo "### Packages"
+            echo '```'
+            (cd "$PACKAGE_DIR" && sha256sum -- *.zip)
+            echo '```'
+            echo "Commit: $GITHUB_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.package-dir }}
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
