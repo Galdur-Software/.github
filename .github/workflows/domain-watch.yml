@@ -1,0 +1,116 @@
+# Reusable: a scheduled watch over a site's domain and email, using the calling repo's copy of athuga_len.py
+# (--vidskiptavinur): MX and STARTTLS, SPF, DMARC, DNSSEC, certificate and domain expiry, security headers and the
+# Mozilla Observatory grade. Keeps one issue per domain: opened when the check reports a VILLA, its body replaced with
+# the latest report while the problem lasts, and closed with a comment once the check passes again. The run itself
+# only fails when the script produced no report, so a broken domain shows up as one issue, not a red run every week.
+#
+#   on:
+#     schedule:
+#       - cron: "23 7 * * 1"
+#   permissions: {}
+#   jobs:
+#     domain:
+#       uses: Galdur-Software/.github/.github/workflows/domain-watch.yml@<sha> # v1
+#       permissions:
+#         contents: read
+#         issues: write
+#       with:
+#         domain: example.is
+#         script: tools/athuga_len.py
+name: domain-watch
+
+on:
+  workflow_call:
+    inputs:
+      domain:
+        description: Domain or host to check, e.g. example.is or www.example.is
+        type: string
+        required: true
+      script:
+        description: Path of athuga_len.py in the calling repo (a uv script that declares its own dependencies)
+        type: string
+        default: tools/athuga_len.py
+      python-version:
+        description: Python version for uv
+        type: string
+        default: "3.12"
+      label:
+        description: Label of the issue this workflow keeps
+        type: string
+        default: domain-watch
+      artifact-name:
+        description: Name of the report artifact
+        type: string
+        default: domain-watch
+
+permissions: {}
+
+jobs:
+  watch:
+    name: domain and email
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Check the domain
+        id: check
+        env:
+          DOMAIN: ${{ inputs.domain }}
+          SCRIPT: ${{ inputs.script }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/report"
+          status=0
+          uv run -q --script "$SCRIPT" "$DOMAIN" --vidskiptavinur --ut "$RUNNER_TEMP/report/report.md" || status=$?
+          if [ ! -s "$RUNNER_TEMP/report/report.md" ]; then
+            echo "::error::$SCRIPT wrote no report (exit $status)"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/report/report.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DOMAIN: ${{ inputs.domain }}
+          LABEL: ${{ inputs.label }}
+          STATUS: ${{ steps.check.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Lén og póstur: $DOMAIN"
+          body="$RUNNER_TEMP/report/issue.md"
+          { cat "$RUNNER_TEMP/report/report.md"; echo; echo "Síðasta keyrsla: $RUN_URL"; } > "$body"
+          gh label create "$LABEL" --color D93F0B --description "Weekly domain and email check" --force >/dev/null
+          number=$(gh issue list --label "$LABEL" --state open --limit 100 --json number,title \
+            | jq -r --arg t "$title" '[.[] | select(.title == $t)][0].number // empty')
+          if [ "$STATUS" != 0 ]; then
+            if [ -n "$number" ]; then
+              gh issue edit "$number" --body-file "$body" >/dev/null
+              echo "Updated issue #$number" >> "$GITHUB_STEP_SUMMARY"
+            else
+              url=$(gh issue create --title "$title" --label "$LABEL" --body-file "$body")
+              echo "Opened $url" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          elif [ -n "$number" ]; then
+            gh issue comment "$number" --body "Allt í lagi aftur $(date -u +%F): engin VILLA. $RUN_URL" >/dev/null
+            gh issue close "$number" >/dev/null
+            echo "Closed issue #$number" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/report
+          if-no-files-found: warn
+          retention-days: 30
