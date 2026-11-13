@@ -1,5 +1,5 @@
-# Reusable: PHP lint of WordPress themes and plugins on several PHP versions, the repo's own tests, and its
-# package command. The packages are uploaded as an artifact, which wp-deploy-sftp.yml later deploys unchanged.
+# Reusable: PHP lint of WordPress themes and plugins on several PHP versions, a parse check of their JSON files, the
+# repo's own tests, and its package command. The packages are uploaded as an artifact, which wp-deploy-sftp.yml later deploys unchanged.
 #
 #   jobs:
 #     wp:
@@ -83,6 +83,34 @@ jobs:
             echo "PHP $(php -r "echo PHP_VERSION;"): $n files, $bad with errors or warnings"
             [ "$n" -gt 0 ] && [ "$bad" -eq 0 ]'
 
+  # theme.json, block.json and pods/pods.json. Pods drops a site's content types without any error when pods.json is
+  # invalid, so a typo there would otherwise only show up as missing pages on the live site.
+  json:
+    name: json
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Every .json file parses
+        env:
+          LINT_PATHS: ${{ inputs.paths }}
+        run: |
+          read -ra dirs <<<"$LINT_PATHS"
+          n=0; bad=0
+          while IFS= read -r -d '' f; do
+            n=$((n+1))
+            if ! out=$(python3 -m json.tool "$f" 2>&1 >/dev/null); then
+              bad=$((bad+1)); echo "::error file=$f::$(printf '%s' "$out" | tail -n1)"
+            fi
+          done < <(find "${dirs[@]}" -name '*.json' -not -path '*/node_modules/*' -print0 | sort -z)
+          echo "$n JSON files, $bad invalid"
+          [ "$bad" -eq 0 ]
+
   test:
     name: test
     if: inputs.test-command != ''
@@ -104,9 +132,9 @@ jobs:
 
   package:
     name: package
-    needs: [lint, test]
+    needs: [lint, json, test]
     if: >-
-      !cancelled() && inputs.package-command != '' && needs.lint.result == 'success'
+      !cancelled() && inputs.package-command != '' && needs.lint.result == 'success' && needs.json.result == 'success'
       && (needs.test.result == 'success' || needs.test.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 15

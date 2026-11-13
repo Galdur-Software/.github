@@ -10,7 +10,7 @@ Nothing here holds secrets, host names or client data: a repo calls a workflow, 
 | `python-ci.yml` | uv virtualenv, `pip install -r requirements.txt`, then the repo's test command (default `python tests/smoke.py --strict`) |
 | `security.yml` | gitleaks over the whole git history, zizmor over the repo's own workflows; plain binaries, checksum-verified |
 | `docker-image.yml` | `docker build`; with `push: true` from a `vX.Y.Z` tag, push `ghcr.io/<owner>/<repo>:X.Y.Z` (must match `VERSION`) and `:sha-…`. Needs `packages: write` |
-| `wp-ci.yml` | WordPress themes and plugins: `php -l` on several PHP versions (deprecations fail), the repo's test command, then its package command; the zips are uploaded as an artifact |
+| `wp-ci.yml` | WordPress themes and plugins: `php -l` on several PHP versions (deprecations fail), every `.json` file must parse (theme.json, block.json, Pods' `pods.json`), the repo's test command, then its package command; the zips are uploaded as an artifact |
 | `wp-site-check.yml` | The repo's site check script (Playwright, Chromium) against a preview or live URL; markdown report as artifact and job summary. Optional `login` secret for a password-protected preview |
 | `wp-handoff-docs.yml` | The repo's command that builds handoff PDFs (guide, login sheet), shrunk with Ghostscript, kept as an artifact. Gets no secrets, by design |
 | `wp-deploy-sftp.yml` | Deploys the packages from the successful CI run for one commit over SFTP (password, no shell needed), then checks the versions over the WordPress REST API with an application password. Needs `actions: read`. Call it from a `workflow_dispatch` workflow: pressing Run is the approval |
